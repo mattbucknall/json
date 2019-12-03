@@ -968,6 +968,7 @@ static json_token_type_t lex_string(json_read_context_t* ctx)
         }
         else if ( is_quote(c) )
         {
+            str[str_index] = '\0';
             ctx->token_value = json_new_string_take(str);
 
             if ( !ctx->token_value )
