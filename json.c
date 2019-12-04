@@ -121,6 +121,7 @@ typedef struct
     unsigned char* buffer_i;
     unsigned char* buffer_e;
     unichar_t prev_char;
+    json_token_type_t token_type;
     json_t* token_value;
     json_result_t result;
 
@@ -175,7 +176,7 @@ static unsigned long decode_utf8(unsigned long* state, unichar_t* codep, unsigne
     return *state;
 }
 
-/* ======================================================================= */
+/* ============================ UTF-8 Encoder ============================= */
 
 static int encode_utf8(char* buffer, unichar_t code_point)
 {
@@ -201,6 +202,7 @@ static int encode_utf8(char* buffer, unichar_t code_point)
     return len;
 }
 
+/* ======================================================================= */
 
 const char* json_result_to_string(json_result_t result)
 {
@@ -222,6 +224,7 @@ const char* json_result_to_string(json_result_t result)
     case JSON_RESULT_INVALID_NUMBER:            return "invalid number";
     case JSON_RESULT_STRING_TOO_LONG:           return "string too long";
     case JSON_RESULT_INVALID_ESCAPE_SEQUENCE:   return "invalid escape sequence";
+    case JSON_RESULT_SYNTAX_ERROR:              return "syntax error";
     default:                                    return "undefined";
     }
 }
@@ -373,7 +376,7 @@ void json_unref(json_t* value)
         if ( value->type == JSON_TYPE_STRING )
         {
             json_string_node_t* string = (json_string_node_t*) value;
-            free(string->value);
+            if ( string->value ) free(string->value);
         }
         else if ( value->type == JSON_TYPE_ARRAY )
         {
@@ -406,8 +409,6 @@ void json_unref(json_t* value)
                 child = next;
             }
         }
-
-        printf("\nfreeing %s\n", json_type_to_string(value->type));
 
         free(value);
     }
@@ -968,7 +969,6 @@ static json_token_type_t lex_string(json_read_context_t* ctx)
         }
         else if ( is_quote(c) )
         {
-            str[str_index] = '\0';
             ctx->token_value = json_new_string_take(str);
 
             if ( !ctx->token_value )
@@ -1161,7 +1161,7 @@ static json_token_type_t lex_number(json_read_context_t* ctx)
 }
 
 
-static json_token_type_t next(json_read_context_t* ctx)
+static json_token_type_t lex(json_read_context_t* ctx)
 {
     if ( ctx->token_value )
     {
@@ -1267,6 +1267,284 @@ static json_token_type_t next(json_read_context_t* ctx)
 }
 
 
+static json_token_type_t next_token(json_read_context_t* ctx)
+{
+    ctx->token_type = lex(ctx);
+    return ctx->token_type;
+}
+
+
+static int match_token(json_read_context_t* ctx, json_token_type_t type)
+{
+    if ( ctx->token_type == type )
+    {
+        next_token(ctx);
+        return 1;
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+
+static int expect_token(json_read_context_t* ctx, json_token_type_t type)
+{
+    if ( ctx->token_type != type )
+    {
+        ctx->result = JSON_RESULT_SYNTAX_ERROR;
+        return 0;
+    }
+
+    return 1;
+}
+
+
+static json_t* parse_array(json_read_context_t* ctx)
+{
+    json_t* array;
+
+    if ( ctx->depth <= 1 )
+    {
+        ctx->result = JSON_RESULT_MAX_DEPTH_EXCEEDED;
+        return NULL;
+    }
+
+    ctx->depth--;
+
+    array = json_new_array();
+
+    if ( !array )
+    {
+        ctx->result = JSON_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+
+    if ( !match_token(ctx, JSON_TOKEN_TYPE_ARRAY_CLOSE) )
+    {
+        if ( ctx->result != JSON_RESULT_OK )
+        {
+            json_unref(array);
+            return NULL;
+        }
+
+        for (;;)
+        {
+            json_t* value;
+
+            value = parse_value(ctx);
+
+            if ( ctx->result != JSON_RESULT_OK )
+            {
+                if ( value ) json_unref(value);
+                json_unref(array);
+                return NULL;
+            }
+
+            ctx->result = json_append(array, value);
+            json_unref(value);
+
+            if ( ctx->result != JSON_RESULT_OK )
+            {
+                json_unref(array);
+                return NULL;
+            }
+
+            if ( match_token(ctx, JSON_TOKEN_TYPE_COMMA) )
+            {
+                if ( ctx->result != JSON_RESULT_OK )
+                {
+                    json_unref(array);
+                    return NULL;
+                }
+
+                continue;
+            }
+
+            if ( !match_token(ctx, JSON_TOKEN_TYPE_ARRAY_CLOSE) )
+            {
+                ctx->result = JSON_RESULT_SYNTAX_ERROR;
+                json_unref(array);
+                return NULL;
+            }
+
+            break;
+        }
+    }
+
+    ctx->depth++;
+
+    return array;
+}
+
+
+static json_t* parse_object(json_read_context_t* ctx)
+{
+    json_t* object;
+
+    if ( ctx->depth <= 1 )
+    {
+        ctx->result = JSON_RESULT_MAX_DEPTH_EXCEEDED;
+        return NULL;
+    }
+
+    ctx->depth--;
+
+    object = json_new_object();
+
+    if ( !object )
+    {
+        ctx->result = JSON_RESULT_OUT_OF_MEMORY;
+        return NULL;
+    }
+
+    if ( !match_token(ctx, JSON_TOKEN_TYPE_OBJECT_CLOSE) )
+    {
+        if ( ctx->result != JSON_RESULT_OK )
+        {
+            json_unref(object);
+            return NULL;
+        }
+
+        for (;;)
+        {
+            json_string_node_t* str;
+            char* key;
+            json_t* value;
+
+            if ( !expect_token(ctx, JSON_TOKEN_TYPE_LITERAL) ||
+                    ctx->result != JSON_RESULT_OK ||
+                    json_type(ctx->token_value) != JSON_TYPE_STRING )
+            {
+                 json_unref(object);
+                 return NULL;
+            }
+
+            str = (json_string_node_t*) (ctx->token_value);
+            key = str->value;
+            str->value = NULL;
+
+            json_unref(ctx->token_value);
+            ctx->token_value = NULL;
+
+            next_token(ctx);
+
+            if ( ctx->result != JSON_RESULT_OK )
+            {
+                free(key);
+                json_unref(object);
+                return NULL;
+            }
+
+            if ( !match_token(ctx, JSON_TOKEN_TYPE_KEY_VAL_SEPARATOR) ||
+                    ctx->result != JSON_RESULT_OK )
+            {
+                free(key);
+                json_unref(object);
+                return NULL;
+            }
+
+            value = parse_value(ctx);
+
+            if ( ctx->result != JSON_RESULT_OK )
+            {
+                if ( value ) json_unref(value);
+                free(key);
+                json_unref(object);
+                return NULL;
+            }
+
+            ctx->result = json_set_take_key(object, key, value);
+            json_unref(value);
+
+            if ( ctx->result != JSON_RESULT_OK )
+            {
+                free(key);
+                json_unref(object);
+                return NULL;
+            }
+
+            if ( match_token(ctx, JSON_TOKEN_TYPE_COMMA) )
+            {
+                if ( ctx->result != JSON_RESULT_OK )
+                {
+                    json_unref(object);
+                    return NULL;
+                }
+
+                continue;
+            }
+
+            if ( !match_token(ctx, JSON_TOKEN_TYPE_OBJECT_CLOSE) )
+            {
+                ctx->result = JSON_RESULT_SYNTAX_ERROR;
+                json_unref(object);
+                return NULL;
+            }
+
+            break;
+        }
+    }
+
+    ctx->depth++;
+
+    return object;
+}
+
+
+static json_t* parse_value(json_read_context_t* ctx)
+{
+    json_t* value;
+
+    if ( match_token(ctx, JSON_TOKEN_TYPE_ARRAY_OPEN) )
+    {
+        if ( ctx->result != JSON_RESULT_OK ) return NULL;
+        value = parse_array(ctx);
+    }
+    else if ( match_token(ctx, JSON_TOKEN_TYPE_OBJECT_OPEN) )
+    {
+        if ( ctx->result != JSON_RESULT_OK ) return NULL;
+        value = parse_object(ctx);
+    }
+    else
+    {
+        expect_token(ctx, JSON_TOKEN_TYPE_LITERAL);
+        if ( ctx->result != JSON_RESULT_OK ) return NULL;
+
+        value = ctx->token_value;
+        ctx->token_value = NULL;
+
+        next_token(ctx);
+    }
+
+    return value;
+}
+
+
+static json_t* parse_doc(json_read_context_t* ctx)
+{
+    json_t* root;
+
+    root = parse_value(ctx);
+
+    if ( ctx->result != JSON_RESULT_OK )
+    {
+        if ( root ) json_unref(root);
+        return NULL;
+    }
+
+    expect_token(ctx, JSON_TOKEN_TYPE_END_OF_INPUT);
+
+    if ( ctx->result != JSON_RESULT_OK )
+    {
+        if ( root ) json_unref(root);
+        return NULL;
+    }
+
+    return root;
+}
+
+
 json_t* json_read(json_read_func_t read_func, void* user_data, size_t max_depth,
         size_t max_string_length, json_result_t* result)
 {
@@ -1282,14 +1560,25 @@ json_t* json_read(json_read_func_t read_func, void* user_data, size_t max_depth,
     ctx.max_string_length = max_string_length;
     ctx.buffer_i = ctx.buffer;
     ctx.buffer_e = ctx.buffer;
+    ctx.token_type = JSON_TOKEN_TYPE_UNDEFINED;
     ctx.token_value = NULL;
     ctx.result = JSON_RESULT_OK;
 
-    root = parse_value(&ctx);
+    next_token(&ctx);
 
+    if ( ctx.result != JSON_RESULT_OK )
+    {
+        if ( ctx.token_value ) json_unref(ctx.token_value);
+        if ( result ) *result = ctx.result;
+        return NULL;
+    }
+
+    root = parse_doc(&ctx);
     if ( result ) *result = ctx.result;
 
-    if ( result != JSON_RESULT_OK )
+    if ( ctx.token_value ) json_unref(ctx.token_value);
+
+    if ( ctx.result != JSON_RESULT_OK )
     {
         if ( root )
         {
@@ -1297,8 +1586,6 @@ json_t* json_read(json_read_func_t read_func, void* user_data, size_t max_depth,
             root = NULL;
         }
     }
-
-    if ( ctx.token_value ) json_unref(ctx.token_value);
 
     return root;
 }

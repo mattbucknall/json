@@ -4,7 +4,7 @@
 #include <json.h>
 
 
-static const char* DOC = "foo";
+static const char* DOC = "{\"key1\": 123, \"key2\": \"value\\u00a6\", \"key1\": 92}";
 static const char* doc_i;
 static const char* doc_e;
 
