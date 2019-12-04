@@ -1,4 +1,5 @@
 # json
-Fairly uninspired implementation of JSON reader/writer and object model, written in C
+C implementation of JSON reader/writer and object model.
 
-## Work In Progress!
+## Status
+Complete but without unit tests.
